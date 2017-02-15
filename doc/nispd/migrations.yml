@@ -1,0 +1,14 @@
+callbacks:
+    beforeAll:
+        - callbacks/beforeAll
+    beforeEach:
+        - callbacks/beforeEach
+    afterEach:
+        - callbacks/afterEach
+    afterAll:
+        - callbacks/afterAll
+        - grants
+conn: 
+    - dbname=nispd user=pgsql password=pgsql host=localhost connect_timeout=10 client_encoding=utf8
+    - dbname=test user=pgsql password=pgsql host=localhost
+    - dbname=nispd_test user=avtomonov password=81549 host=pgsqltest2.mcn.ru

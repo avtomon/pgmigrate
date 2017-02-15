@@ -1,27 +1,4 @@
-#!/usr/bin/env python
-'''
-PGmigrate - PostgreSQL migrations made easy
-'''
-# -*- coding: utf-8 -*-
-#
-#    Copyright (c) 2016-2017 Yandex LLC <https://github.com/yandex>
-#    Copyright (c) 2016-2017 Other contributors as noted in the AUTHORS file.
-#
-#    Permission to use, copy, modify, and distribute this software and its
-#    documentation for any purpose, without fee, and without a written
-#    agreement is hereby granted, provided that the above copyright notice
-#    and this paragraph and the following two paragraphs appear in all copies.
-#
-#    IN NO EVENT SHALL YANDEX LLC BE LIABLE TO ANY PARTY FOR DIRECT,
-#    INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, INCLUDING LOST
-#    PROFITS, ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS DOCUMENTATION,
-#    EVEN IF YANDEX LLC HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-#
-#    YANDEX SPECIFICALLY DISCLAIMS ANY WARRANTIES, INCLUDING, BUT NOT
-#    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
-#    PARTICULAR PURPOSE. THE SOFTWARE PROVIDED HEREUNDER IS ON AN "AS IS"
-#    BASIS, AND YANDEX LLC HAS NO OBLIGATIONS TO PROVIDE MAINTENANCE,
-#    SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+#!/usr/local/bin/python3.5
 
 from __future__ import absolute_import, print_function, unicode_literals
 
@@ -41,6 +18,12 @@ import yaml
 from psycopg2.extras import LoggingConnection
 
 LOG = logging.getLogger(__name__)
+main_handler = logging.FileHandler('/var/log/pgmigrate/log.log')
+LOG.addHandler(main_handler)
+
+POSTGRES_LOG = logging.getLogger('postgres_log')
+postgres_handler = logging.FileHandler('/var/log/pgmigrate/postgres.log')
+POSTGRES_LOG.addHandler(postgres_handler)
 
 
 class MigrateError(RuntimeError):
@@ -90,7 +73,7 @@ REF_COLUMNS = ['version', 'description', 'type',
 
 def _create_connection(conn_string):
     conn = psycopg2.connect(conn_string, connection_factory=LoggingConnection)
-    conn.initialize(LOG)
+    conn.initialize(POSTGRES_LOG)
 
     return conn
 
@@ -103,14 +86,14 @@ def _is_initialized(cursor):
                            'information_schema.tables '
                            'WHERE table_schema = %s '
                            'AND table_name = %s);',
-                           ('public', 'schema_version'))
+                           ('pgmigrate', 'schema_version'))
     cursor.execute(query)
     table_exists = cursor.fetchone()[0]
 
     if not table_exists:
         return False
 
-    cursor.execute('SELECT * from public.schema_version limit 1;')
+    cursor.execute('SELECT * FROM pgmigrate.schema_version LIMIT 1;')
 
     colnames = [desc[0] for desc in cursor.description]
 
@@ -118,11 +101,14 @@ def _is_initialized(cursor):
         raise MalformedSchema('Table schema_version has unexpected '
                               'structure: %s' % '|'.join(colnames))
 
+
     return True
 
 MIGRATION_FILE_RE = re.compile(
     r'V(?P<version>\d+)__(?P<description>.+)\.sql$'
 )
+
+IS_UPGRADE = True
 
 
 MigrationInfo = namedtuple('MigrationInfo', ('meta', 'filePath'))
@@ -174,29 +160,81 @@ def _get_migrations_info_from_dir(base_dir):
     return migrations
 
 
+def _get_downgrades_info_from_dir(base_dir):
+    '''
+    Get all migrations from base dir
+    '''
+    path = os.path.join(base_dir, 'downgrades')
+    downgrades = {}
+    if os.path.exists(path) and os.path.isdir(path):
+        for fname in os.listdir(path):
+            file_path = os.path.join(path, fname)
+            if not os.path.isfile(file_path):
+                continue
+            match = MIGRATION_FILE_RE.match(fname)
+            if match is None:
+                continue
+            version = int(match.group('version'))
+            ret = dict(
+                version=version,
+                type='auto',
+                installed_by=None,
+                installed_on=None,
+                description=match.group('description').replace('_', ' ')
+            )
+            ret['transactional'] = 'NONTRANSACTIONAL' not in ret['description']
+            downgrade = MigrationInfo(
+                ret,
+                file_path
+            )
+            if version in downgrades:
+                raise MalformedMigration(
+                    'Found downgrades with same version: %d ' % version +
+                    '\nfirst : %s' % downgrade.filePath +
+                    '\nsecond: %s' % downgrades[version].filePath)
+            downgrades[version] = downgrade
+
+    return downgrades
+
+
 def _get_migrations_info(base_dir, baseline_v, target_v):
     '''
     Get migrations from baseline to target from base dir
     '''
-    migrations = {}
-    for version, ret in _get_migrations_info_from_dir(base_dir).items():
-        if version > baseline_v and version <= target_v:
-            migrations[version] = ret.meta
-        else:
-            LOG.info(
-                'Ignore migration %r cause baseline: %r or target: %r',
-                ret, baseline_v, target_v
-            )
-    return migrations
+    if target_v >= baseline_v:
+        migrations = {}
+        for version, ret in _get_migrations_info_from_dir(base_dir).items():
+            if version > baseline_v and version <= target_v:
+                migrations[version] = ret.meta
+            else:
+                LOG.info(
+                    'Ignore migration %r cause baseline: %r or target: %r',
+                    ret, baseline_v, target_v
+                )
+        return migrations
+    else:
+        downgrades = {}
+        global IS_UPGRADE
+        IS_UPGRADE = False
+        for version, ret in _get_downgrades_info_from_dir(base_dir).items():
+            if version < baseline_v and version >= target_v:
+                downgrades[version] = ret.meta
+            else:
+                LOG.info(
+                    'Ignore downgrade %r cause baseline: %r or target: %r',
+                    ret, baseline_v, target_v
+                )
+        return downgrades
 
 
 def _get_info(base_dir, baseline_v, target_v, cursor):
     '''
     Get migrations info from database and base dir
     '''
+
     ret = {}
     cursor.execute('SELECT ' + ', '.join(REF_COLUMNS) +
-                   ' from public.schema_version;')
+                   ' from pgmigrate.schema_version;')
 
     for i in cursor.fetchall():
         version = {}
@@ -210,14 +248,25 @@ def _get_info(base_dir, baseline_v, target_v, cursor):
         version['transactional'] = transactional
         ret[version['version']] = version
 
+    try:
+        sorted(ret.keys())[-1]
+    except IndexError:
+        pass
+    else:
         baseline_v = max(baseline_v, sorted(ret.keys())[-1])
-        migrations_info = _get_migrations_info(base_dir, baseline_v, target_v)
-        for version in migrations_info:
-            num = migrations_info[version]['version']
-            if num not in ret:
-                ret[num] = migrations_info[version]
 
-    return ret
+    migrations_info = _get_migrations_info(base_dir, baseline_v, target_v)
+    new_ret = {}
+    for version in migrations_info:
+        num = migrations_info[version]['version']
+        if IS_UPGRADE:
+            if num not in ret:
+                new_ret[num] = migrations_info[version]
+        else:
+            if num in ret or num == 0:
+                new_ret[num] = migrations_info[version]
+
+    return new_ret
 
 
 def _get_state(base_dir, baseline_v, target, cursor):
@@ -234,7 +283,7 @@ def _set_baseline(baseline_v, cursor):
     '''
     Cleanup schema_version and set baseline
     '''
-    query = cursor.mogrify('SELECT EXISTS(SELECT 1 FROM public'
+    query = cursor.mogrify('SELECT EXISTS(SELECT 1 FROM pgmigrate'
                            '.schema_version WHERE version >= %s::bigint);',
                            (baseline_v,))
     cursor.execute(query)
@@ -245,11 +294,11 @@ def _set_baseline(baseline_v, cursor):
                             '%s already applied' % text(baseline_v))
 
     LOG.info('cleaning up table schema_version')
-    cursor.execute('DELETE FROM public.schema_version;')
+    cursor.execute('DELETE FROM pgmigrate.schema_version;')
     LOG.info(cursor.statusmessage)
 
     LOG.info('setting baseline')
-    query = cursor.mogrify('INSERT INTO public.schema_version '
+    query = cursor.mogrify('INSERT INTO pgmigrate.schema_version '
                            '(version, type, description, installed_by) '
                            'VALUES (%s::bigint, %s, %s, CURRENT_USER);',
                            (text(baseline_v), 'manual', 'Forced baseline'))
@@ -262,15 +311,15 @@ def _init_schema(cursor):
     Create schema_version table
     '''
     LOG.info('creating type schema_version_type')
-    query = cursor.mogrify('CREATE TYPE public.schema_version_type '
+    query = cursor.mogrify('CREATE TYPE pgmigrate.schema_version_type '
                            'AS ENUM (%s, %s);', ('auto', 'manual'))
     cursor.execute(query)
     LOG.info(cursor.statusmessage)
     LOG.info('creating table schema_version')
-    query = cursor.mogrify('CREATE TABLE public.schema_version ('
+    query = cursor.mogrify('CREATE TABLE pgmigrate.schema_version ('
                            'version BIGINT NOT NULL PRIMARY KEY, '
                            'description TEXT NOT NULL, '
-                           'type public.schema_version_type NOT NULL '
+                           'type pgmigrate.schema_version_type NOT NULL '
                            'DEFAULT %s, '
                            'installed_by TEXT NOT NULL, '
                            'installed_on TIMESTAMP WITHOUT time ZONE '
@@ -328,16 +377,26 @@ def _apply_version(version, base_dir, cursor):
     '''
     Execute all statements in migration version
     '''
-    all_versions = _get_migrations_info_from_dir(base_dir)
+    if IS_UPGRADE:
+        all_versions = _get_migrations_info_from_dir(base_dir)
+    else:
+        all_versions = _get_downgrades_info_from_dir(base_dir)
+
     version_info = all_versions[version]
     LOG.info('Try apply version %r', version_info)
 
     _apply_file(version_info.filePath, cursor)
-    query = cursor.mogrify('INSERT INTO public.schema_version '
-                           '(version, description, installed_by) '
-                           'VALUES (%s::bigint, %s, CURRENT_USER)',
-                           (text(version),
-                            version_info.meta['description']))
+
+    if IS_UPGRADE:
+        query = cursor.mogrify('INSERT INTO pgmigrate.schema_version '
+                               '(version, description, installed_by) '
+                               'VALUES (%s::bigint, %s, CURRENT_USER)',
+                               (text(version),
+                                version_info.meta['description']))
+    else:
+        query = cursor.mogrify('DELETE FROM pgmigrate.schema_version '
+                               'WHERE version > %s::bigint',
+                               (text(version),))
     cursor.execute(query)
 
 
@@ -394,54 +453,60 @@ def _get_callbacks(callbacks, base_dir=''):
         return _parse_str_callbacks(callbacks, ret, base_dir)
 
 
-def _migrate_step(state, callbacks, base_dir, cursor):
+def _migrate_step(state, callbacks, base_dir, cursor): # state - needs migrations, callbacks - fucking callbacks, base_dir - path to migration system files for present DB, cursor - DB connection
     '''
     Apply one version with callbacks
     '''
     before_all_executed = False
     should_migrate = False
     cursor.execute('SET lock_timeout = 0;')
-    if not _is_initialized(cursor):
+    if not _is_initialized(cursor): # If schema_version is not done
         LOG.info('schema not initialized')
-        _init_schema(cursor)
-    for version in sorted(state.keys()):
+        _init_schema(cursor) # create schema_version
+    if IS_UPGRADE:
+        state_keys = sorted(state.keys())
+    else:
+        state_keys = sorted(state.keys(), key = None, reverse = True)
+    for version in state_keys: # pluck the migrations list
         LOG.debug('has version %r', version)
-        if state[version]['installed_on'] is None:
+        if state[version]['installed_on'] is None: # if migration is not installed
             should_migrate = True
-            if not before_all_executed and callbacks.beforeAll:
+            if not before_all_executed and callbacks.beforeAll: # if before callbacks is present
                 LOG.info('Executing beforeAll callbacks:')
                 for callback in callbacks.beforeAll:
-                    _apply_file(callback, cursor)
+                    _apply_file(callback, cursor) # execute callback
                     LOG.info(callback)
                 before_all_executed = True
 
             LOG.info('Migrating to version %d', version)
-            if callbacks.beforeEach:
+            if callbacks.beforeEach: # if before each callbacks is present
                 LOG.info('Executing beforeEach callbacks:')
                 for callback in callbacks.beforeEach:
                     LOG.info(callback)
-                    _apply_file(callback, cursor)
+                    _apply_file(callback, cursor) # execute beforeEach callback
 
-            _apply_version(version, base_dir, cursor)
+            _apply_version(version, base_dir, cursor) # apply all needed migrations
 
-            if callbacks.afterEach:
+            if callbacks.afterEach: # if afterEach callbacks is present
                 LOG.info('Executing afterEach callbacks:')
                 for callback in callbacks.afterEach:
                     LOG.info(callback)
-                    _apply_file(callback, cursor)
+                    _apply_file(callback, cursor) # apply afterEach callback
 
-    if should_migrate and callbacks.afterAll:
+    if should_migrate and callbacks.afterAll: # if afterAll callbacks is present
         LOG.info('Executing afterAll callbacks:')
         for callback in callbacks.afterAll:
             LOG.info(callback)
-            _apply_file(callback, cursor)
+            _apply_file(callback, cursor) # execute afterAll callbacks
 
 
 def _finish(config):
     if config.dryrun:
-        config.cursor.execute('rollback')
+        for cursor in config.cursor:
+            cursor.execute('rollback')
     else:
-        config.cursor.execute('commit')
+        for cursor in config.cursor:
+            cursor.execute('commit')
 
 
 def info(config, stdout=True):
@@ -449,7 +514,7 @@ def info(config, stdout=True):
     Info cmdline wrapper
     '''
     state = _get_state(config.base_dir, config.baseline,
-                       config.target, config.cursor)
+                       config.target, config.cursor[0])
     if stdout:
         sys.stdout.write(
             json.dumps(state, indent=4, separators=(',', ': ')) + '\n')
@@ -463,23 +528,26 @@ def clean(config):
     '''
     Drop schema_version table
     '''
-    if _is_initialized(config.cursor):
-        LOG.info('dropping schema_version')
-        config.cursor.execute('DROP TABLE public.schema_version;')
-        LOG.info(config.cursor.statusmessage)
-        LOG.info('dropping schema_version_type')
-        config.cursor.execute('DROP TYPE public.schema_version_type;')
-        LOG.info(config.cursor.statusmessage)
-        _finish(config)
+    for cursor in config.cursor:
+        if _is_initialized(cursor):
+            LOG.info('dropping schema_version')
+            cursor.execute('DROP TABLE pgmigrate.schema_version;')
+            LOG.info(cursor.statusmessage)
+            LOG.info('dropping schema_version_type')
+            cursor.execute('DROP TYPE pgmigrate.schema_version_type;')
+            LOG.info(cursor.statusmessage)
+
+    _finish(config)
 
 
 def baseline(config):
     '''
     Set baseline cmdline wrapper
     '''
-    if not _is_initialized(config.cursor):
-        _init_schema(config.cursor)
-    _set_baseline(config.baseline, config.cursor)
+    for cursor in config.cursor:
+        if not _is_initialized(cursor):
+            _init_schema(cursor)
+        _set_baseline(config.baseline, cursor)
 
     _finish(config)
 
@@ -528,51 +596,54 @@ def migrate(config):
     '''
     Migrate cmdline wrapper
     '''
+    LOG.info('Start migrating script')
     if config.target is None:
         LOG.error('Unknown target')
         raise MigrateError('Unknown target')
-    state = _get_state(config.base_dir, config.baseline,
-                       config.target, config.cursor)
-    not_applied = [x for x in state if state[x]['installed_on'] is None]
-    non_trans = [x for x in not_applied if not state[x]['transactional']]
+    for index, cursor in enumerate(config.cursor):
+        state = _get_state(config.base_dir, config.baseline, config.target, cursor)
 
-    if len(non_trans) > 0:
-        if config.dryrun:
-            LOG.error('Dry run for nontransactional migrations '
-                      'is nonsence')
-            raise MigrateError('Dry run for nontransactional migrations '
-                               'is nonsence')
-        if len(state) != len(not_applied):
-            if len(not_applied) != len(non_trans):
-                LOG.error('Unable to mix transactional and '
-                          'nontransactional migrations')
-                raise MigrateError('Unable to mix transactional and '
-                                   'nontransactional migrations')
-            config.cursor.execute('rollback;')
-            nt_conn = _create_connection(config.conn)
-            nt_conn.autocommit = True
-            cursor = nt_conn.cursor()
-            _migrate_step(state, _get_callbacks(''),
-                          config.base_dir, cursor)
-        else:
-            steps = _prepare_nontransactional_steps(state, config.callbacks)
+        if state is not None:
+            not_applied = [x for x in state if state[x]['installed_on'] is None]
+            non_trans = [x for x in not_applied if not state[x]['transactional']]
 
-            nt_conn = _create_connection(config.conn)
-            nt_conn.autocommit = True
-
-            commit_req = False
-            for step in steps:
-                if commit_req:
-                    config.cursor.execute('commit')
-                    commit_req = False
-                if not list(step['state'].values())[0]['transactional']:
-                    cur = nt_conn.cursor()
+            if len(non_trans) > 0:
+                if config.dryrun:
+                    LOG.error('Dry run for nontransactional migrations '
+                              'is nonsence')
+                    raise MigrateError('Dry run for nontransactional migrations '
+                                       'is nonsence')
+                if len(state) != len(not_applied):
+                    if len(not_applied) != len(non_trans):
+                        LOG.error('Unable to mix transactional and '
+                                  'nontransactional migrations')
+                        raise MigrateError('Unable to mix transactional and '
+                                           'nontransactional migrations')
+                    cursor.execute('rollback;')
+                    nt_conn = _create_connection(config.conn[enumerate])
+                    nt_conn.autocommit = True
+                    cursor = nt_conn.cursor()
+                    _migrate_step(state, _get_callbacks(''),
+                                  config.base_dir, cursor)
                 else:
-                    cur = config.cursor
-                    commit_req = True
-                _migrate_step(step['state'], step['cbs'], config.base_dir, cur)
-    else:
-        _migrate_step(state, config.callbacks, config.base_dir, config.cursor)
+                    steps = _prepare_nontransactional_steps(state, config.callbacks)
+
+                    nt_conn = _create_connection(config.conn)
+                    nt_conn.autocommit = True
+
+                    commit_req = False
+                    for step in steps:
+                        if commit_req:
+                            cursor.execute('commit')
+                            commit_req = False
+                        if not list(step['state'].values())[0]['transactional']:
+                            cur = nt_conn.cursor()
+                        else:
+                            cur = cursor
+                            commit_req = True
+                        _migrate_step(step['state'], step['cbs'], config.base_dir, cur)
+            else:
+                _migrate_step(state, config.callbacks, config.base_dir, cursor)
 
     _finish(config)
 
@@ -583,11 +654,10 @@ COMMANDS = {
     'migrate': migrate,
 }
 
-CONFIG_DEFAULTS = Config(target=None, baseline=0, cursor=None, dryrun=False,
+CONFIG_DEFAULTS = Config(target=None, baseline=0, cursor=[], dryrun=False,
                          callbacks='', base_dir='',
-                         conn='dbname=postgres user=postgres '
-                              'connect_timeout=1',
-                         conn_instance=None)
+                         conn=[],
+                         conn_instance=[])
 
 
 def get_config(base_dir, args=None):
@@ -610,10 +680,9 @@ def get_config(base_dir, args=None):
             if i in args.__dict__ and args.__dict__[i] is not None:
                 conf = conf._replace(**{i: args.__dict__[i]})
 
-    conf = conf._replace(conn_instance=_create_connection(conf.conn))
-    conf = conf._replace(cursor=conf.conn_instance.cursor())
-    conf = conf._replace(callbacks=_get_callbacks(conf.callbacks,
-                                                  conf.base_dir))
+    conf = conf._replace(conn_instance = [_create_connection(connection) for connection in conf.conn])
+    conf = conf._replace(cursor = [connection.cursor() for connection in conf.conn_instance])
+    conf = conf._replace(callbacks=_get_callbacks(conf.callbacks, conf.base_dir))
 
     return conf
 
@@ -655,8 +724,9 @@ def _main():
 
     args = parser.parse_args()
     logging.basicConfig(
-        level=(logging.ERROR - 10*(min(3, args.verbose))),
-        format='%(asctime)s %(levelname)-8s: %(message)s')
+        format='%(asctime)s.%(msecs)d %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        level=logging.DEBUG)
 
     config = get_config(args.base_dir, args)
 
