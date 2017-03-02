@@ -118,7 +118,7 @@ Callbacks = namedtuple('Callbacks', ('beforeAll', 'beforeEach',
 
 Config = namedtuple('Config', ('target', 'baseline', 'cursor', 'dryrun',
                                'callbacks', 'base_dir', 'conn',
-                               'conn_instance'))
+                               'conn_instance', 'db_user', 'db_password'))
 
 CONFIG_IGNORE = ['cursor', 'conn_instance']
 
@@ -225,6 +225,18 @@ def _get_migrations_info(base_dir, baseline_v, target_v):
                     ret, baseline_v, target_v
                 )
         return downgrades
+
+
+def _get_connection_strings_from_db(cursor, config):
+
+    cursor.execute('SELECT name, hostname FROM pgmigrate.server WHERE is_need_db_do_migrate;')
+
+    conns = []
+
+    for row in cursor.fetchall():
+        conns.append('dbname=' + str(row[0]) + ' user=' + config.db_user + ' password=' + config.db_password + ' host=' + str(row[1]))
+
+    return conns
 
 
 def _get_info(base_dir, baseline_v, target_v, cursor):
@@ -502,11 +514,15 @@ def _migrate_step(state, callbacks, base_dir, cursor): # state - needs migration
 
 def _finish(config):
     if config.dryrun:
-        for cursor in config.cursor:
-            cursor.execute('rollback')
+        _rollback(config)
     else:
         for cursor in config.cursor:
             cursor.execute('commit')
+
+
+def _rollback(config):
+    for cursor in config.cursor:
+        cursor.execute('rollback')
 
 
 def info(config, stdout=True):
@@ -656,8 +672,10 @@ COMMANDS = {
 
 CONFIG_DEFAULTS = Config(target=None, baseline=0, cursor=[], dryrun=False,
                          callbacks='', base_dir='',
-                         conn=[],
-                         conn_instance=[])
+                         conn=None,
+                         conn_instance=[],
+                         db_user=None,
+                         db_password=None)
 
 
 def get_config(base_dir, args=None):
@@ -665,9 +683,12 @@ def get_config(base_dir, args=None):
     Load configuration from yml in base dir with respect of args
     '''
     path = os.path.join(base_dir, 'migrations.yml')
+    auth_path = os.path.join(base_dir, 'auth.yml')
     try:
         with codecs.open(path, encoding='utf-8') as i:
             base = yaml.load(i.read())
+        with codecs.open(auth_path, encoding='utf-8') as i:
+            auth = yaml.load(i.read())
     except IOError:
         LOG.info('Unable to load %s. Using defaults', path)
         base = {}
@@ -676,11 +697,21 @@ def get_config(base_dir, args=None):
     for i in [j for j in CONFIG_DEFAULTS._fields if j not in CONFIG_IGNORE]:
         if i in base:
             conf = conf._replace(**{i: base[i]})
+        if i in auth:
+            conf = conf._replace(**{i: auth[i]})
         if args is not None:
             if i in args.__dict__ and args.__dict__[i] is not None:
                 conf = conf._replace(**{i: args.__dict__[i]})
 
-    conf = conf._replace(conn_instance = [_create_connection(connection) for connection in conf.conn])
+    main_conn = _create_connection(conf.conn)
+    connection_strings = []
+
+    if args.conn is None and not args.only_main:
+        connection_strings = _get_connection_strings_from_db(main_conn.cursor(), conf)
+
+    connection_strings.append(conf.conn)
+
+    conf = conf._replace(conn_instance = [_create_connection(connection) for connection in connection_strings])
     conf = conf._replace(cursor = [connection.cursor() for connection in conf.conn_instance])
     conf = conf._replace(callbacks=_get_callbacks(conf.callbacks, conf.base_dir))
 
@@ -721,6 +752,9 @@ def _main():
                         default=0,
                         action='count',
                         help='Be verbose')
+    parser.add_argument('-o', '--only_main',
+                        action='store_true',
+                        help='Execute only on main server')
 
     args = parser.parse_args()
     logging.basicConfig(
@@ -730,7 +764,10 @@ def _main():
 
     config = get_config(args.base_dir, args)
 
-    COMMANDS[args.cmd](config)
+    try:
+        COMMANDS[args.cmd](config)
+    except:
+        _rollback(config)
 
 if __name__ == '__main__':
     _main()
