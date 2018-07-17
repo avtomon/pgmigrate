@@ -1,4 +1,4 @@
-#pgmigrate
+# pgmigrate
 
 Модуль основан на <https://github.com/yandex/pgmigrate>.
 

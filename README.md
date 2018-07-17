@@ -1,4 +1,4 @@
-#pgmigrate
+# pgmigrate
 
 The module is based on <https://github.com/yandex/pgmigrate>.
 
