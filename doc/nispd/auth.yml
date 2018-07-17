@@ -1,4 +1,0 @@
-conn: dbname=nispd user=migrator password=76543vvv host=localhost
-
-db_user: migrator
-db_password: 76543vvv
